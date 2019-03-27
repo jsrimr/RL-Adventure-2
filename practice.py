@@ -35,22 +35,114 @@ class ActorCritic(nn.Module):
     def __init__(self,num_inputs, num_outputs, hidden_size,std=0.0 ):
         super(ActorCritic,self).__init__()
 
-    self.critic = nn.Sequential(
-        nn.Linear(num_inputs, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, 1)
-    )
+        self.critic = nn.Sequential(
+            nn.Linear(num_inputs, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
 
-    self.actor = nn.Sequential(
-        nn.Linear(num_inputs, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, num_outputs),
-        nn.Softmax(dim=1),
-    )
+        self.actor = nn.Sequential(
+            nn.Linear(num_inputs, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, num_outputs),
+            nn.Softmax(dim=1),
+        )
 
 
-def forward(self, x):
-    value = self.critic(x)
-    probs = self.actor(x)
-    dist = Categorical(probs)
-    return dist, value
+    def forward(self, x):
+        value = self.critic(x)
+        probs = self.actor(x)
+        dist = Categorical(probs)
+        return dist, value
+
+def compute_returns(next_value, rewards, masks, gamma = 0.99):
+    R = next_value
+    returns = []
+    for step in reversed(range(len(rewards))):
+        R = rewards[step] + gamma * R * masks[step]
+        returns.insert(0,R)
+    return returns
+
+num_inputs  = envs.observation_space.shape[0]
+num_outputs = envs.action_space.n
+
+#Hyper params:
+hidden_size = 256
+lr          = 3e-4
+num_steps   = 5
+
+model = ActorCritic(num_inputs, num_outputs, hidden_size).to(device)
+optimizer = optim.Adam(model.parameters())
+
+max_frames   = 20000
+frame_idx    = 0
+test_rewards = []
+
+def test_env(vis=False):
+    state = env.reset()
+    if vis: env.render()
+    done = False
+    total_reward = 0
+    while not done:
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        dist, _ = model(state)
+        next_state, reward, done, _ = env.step(dist.sample().cpu().numpy()[0])
+        state = next_state
+        if vis: env.render()
+        total_reward += reward
+    return total_reward
+
+state = envs.reset()
+
+while frame_idx < max_frames:
+
+    log_probs = []
+    values = []
+    rewards = []
+    masks = []
+    entropy = 0
+
+    # num_steps(5) 만큼 진행한다. log_probs, values, rewards  ,entropy 에 흔적이 저장된다.
+    for _ in range(num_steps):
+        state = torch.FloatTensor(state).to(device)
+        dist, value = model(state)
+
+        action = dist.sample()
+        next_state, reward, done, _ = envs.step(action.cpu().numpy())
+
+        log_prob = dist.log_prob(action) # !? 확률을 넣어야 하는거 아닌가? action
+        entropy += dist.entropy().mean()
+
+        log_probs.append(log_prob)
+        values.append(value)
+        rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(device))
+        masks.append(torch.FloatTensor(1 - done).unsqueeze(1).to(device))
+
+        state = next_state
+        frame_idx += 1
+
+        if frame_idx % 1000 == 0:
+            test_rewards.append(np.mean([test_env() for _ in range(10)]))
+
+    #log_probs, values, rewards  ,entropy 를 사용해 업데이트가 진행될 것이다. 5개의 rollout을 사용해 업데이트 하는 것이다.
+
+    next_state = torch.FloatTensor(next_state).to(device)
+    _, next_value = model(next_state)
+    returns = compute_returns(next_value, rewards, masks)
+
+    log_probs = torch.cat(log_probs)
+    returns = torch.cat(returns).detach()
+    values = torch.cat(values)
+
+    advantage = returns - values
+
+    actor_loss = -(log_probs * advantage.detach()).mean()
+    critic_loss = advantage.pow(2).mean()
+
+    loss = actor_loss + 0.5 * critic_loss - 0.001 * entropy
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+test_env(True)
